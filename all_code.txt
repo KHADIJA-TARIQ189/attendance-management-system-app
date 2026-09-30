@@ -1,0 +1,1024 @@
+===== routes\web.php ===== 
+<?php
+
+use App\Http\Controllers\Admin\CourseController;
+use App\Http\Controllers\Admin\UserController;
+use App\Http\Controllers\Auth\LoginController;
+use App\Http\Controllers\DashboardController;
+use App\Http\Controllers\StudentController;
+use App\Http\Controllers\TeacherController;
+use Illuminate\Support\Facades\Route;
+
+Route::get('/', fn () => redirect()->route('login'));
+
+Route::get('/login', [LoginController::class, 'showLoginForm'])->name('login');
+Route::post('/login', [LoginController::class, 'login']);
+Route::post('/logout', [LoginController::class, 'logout'])->name('logout')->middleware('auth');
+
+Route::middleware('auth')->group(function () {
+    Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
+
+    // ---------- ADMIN ----------
+    Route::prefix('admin')->name('admin.')->middleware('role:admin')->group(function () {
+        Route::get('users', [UserController::class, 'index'])->name('users.index');
+        Route::get('users/create', [UserController::class, 'create'])->name('users.create');
+        Route::post('users', [UserController::class, 'store'])->name('users.store');
+        Route::delete('users/{user}', [UserController::class, 'destroy'])->name('users.destroy');
+
+        Route::get('courses', [CourseController::class, 'index'])->name('courses.index');
+        Route::get('courses/create', [CourseController::class, 'create'])->name('courses.create');
+        Route::post('courses', [CourseController::class, 'store'])->name('courses.store');
+        Route::post('courses/{course}/enroll', [CourseController::class, 'enroll'])->name('courses.enroll');
+        Route::delete('courses/{course}', [CourseController::class, 'destroy'])->name('courses.destroy');
+    });
+
+    // ---------- TEACHER (admin can also access, for oversight) ----------
+    Route::middleware('role:teacher,admin')->group(function () {
+        Route::get('courses/{course}/attendance', [TeacherController::class, 'showAttendance'])->name('teacher.attendance.show');
+        Route::post('courses/{course}/attendance', [TeacherController::class, 'saveAttendance'])->name('teacher.attendance.save');
+
+        Route::get('courses/{course}/gradebook', [TeacherController::class, 'gradebook'])->name('teacher.gradebook');
+        Route::post('courses/{course}/quizzes', [TeacherController::class, 'storeQuiz'])->name('teacher.quizzes.store');
+        Route::post('courses/{course}/assignments', [TeacherController::class, 'storeAssignment'])->name('teacher.assignments.store');
+        Route::post('quizzes/{quiz}/marks', [TeacherController::class, 'saveQuizMarks'])->name('teacher.quizzes.marks');
+        Route::post('assignments/{assignment}/marks', [TeacherController::class, 'saveAssignmentMarks'])->name('teacher.assignments.marks');
+    });
+
+    // ---------- STUDENT (view-only) ----------
+    Route::middleware('role:student')->group(function () {
+        Route::get('my-courses/{course}/attendance', [StudentController::class, 'attendance'])->name('student.attendance');
+        Route::get('my-courses/{course}/gradebook', [StudentController::class, 'gradebook'])->name('student.gradebook');
+    });
+});
+===== app\Models\Assignment.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Assignment extends Model
+{
+    protected $fillable = ['course_id', 'title', 'total_marks', 'due_date'];
+
+    public function course() { return $this->belongsTo(Course::class); }
+    public function marks()  { return $this->hasMany(AssignmentMark::class); }
+}
+===== app\Models\AssignmentMark.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class AssignmentMark extends Model
+{
+    protected $fillable = ['assignment_id', 'student_id', 'marks_obtained'];
+
+    public function assignment() { return $this->belongsTo(Assignment::class); }
+    public function student()    { return $this->belongsTo(User::class, 'student_id'); }
+}
+===== app\Models\Attendance.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Attendance extends Model
+{
+    protected $fillable = [
+        'student_id', 'course_id', 'date', 'status', 'marked_by', 'source',
+    ];
+
+    protected $casts = ['date' => 'date'];
+
+    public function student() { return $this->belongsTo(User::class, 'student_id'); }
+    public function course()  { return $this->belongsTo(Course::class); }
+    public function marker()  { return $this->belongsTo(User::class, 'marked_by'); }
+}
+===== app\Models\CoordinatorLog.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class CoordinatorLog extends Model
+{
+    protected $fillable = [
+        'device_eui', 'tag_id', 'raw_payload', 'matched_student_id',
+        'matched_attendance_id', 'status', 'received_at',
+    ];
+
+    protected $casts = [
+        'raw_payload' => 'array',
+        'received_at' => 'datetime',
+    ];
+}
+===== app\Models\Course.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Course extends Model
+{
+    protected $fillable = ['code', 'title', 'credit_hours', 'teacher_id'];
+
+    public function teacher()
+    {
+        return $this->belongsTo(User::class, 'teacher_id');
+    }
+
+    public function students()
+    {
+        return $this->belongsToMany(User::class, 'enrollments', 'course_id', 'student_id');
+    }
+
+    public function attendances()
+    {
+        return $this->hasMany(Attendance::class);
+    }
+
+    public function quizzes()
+    {
+        return $this->hasMany(Quiz::class);
+    }
+
+    public function assignments()
+    {
+        return $this->hasMany(Assignment::class);
+    }
+
+    // Number of distinct class sessions (dates) held so far for this course
+    public function totalSessions(): int
+    {
+        return $this->attendances()->distinct('date')->count('date');
+    }
+
+    // Attendance % for one student in this course
+    public function attendancePercentFor(int $studentId): float
+    {
+        $total = $this->attendances()->where('student_id', $studentId)->count();
+        if ($total === 0) return 0;
+        $present = $this->attendances()
+            ->where('student_id', $studentId)
+            ->whereIn('status', ['present', 'late'])
+            ->count();
+        return round(($present / $total) * 100, 2);
+    }
+}
+===== app\Models\Enrollment.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Enrollment extends Model
+{
+    protected $fillable = ['student_id', 'course_id'];
+
+    public function student() { return $this->belongsTo(User::class, 'student_id'); }
+    public function course()  { return $this->belongsTo(Course::class); }
+}
+===== app\Models\Quiz.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Quiz extends Model
+{
+    protected $fillable = ['course_id', 'title', 'total_marks', 'quiz_date'];
+
+    public function course() { return $this->belongsTo(Course::class); }
+    public function marks()  { return $this->hasMany(QuizMark::class); }
+}
+===== app\Models\QuizMark.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class QuizMark extends Model
+{
+    protected $fillable = ['quiz_id', 'student_id', 'marks_obtained'];
+
+    public function quiz()    { return $this->belongsTo(Quiz::class); }
+    public function student() { return $this->belongsTo(User::class, 'student_id'); }
+}
+===== app\Models\User.php ===== 
+<?php
+
+namespace App\Models;
+
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Notifiable;
+
+class User extends Authenticatable
+{
+    use Notifiable;
+
+    protected $fillable = [
+        'name', 'email', 'password', 'role', 'roll_no', 'lora_tag_id',
+    ];
+
+    protected $hidden = ['password', 'remember_token'];
+
+    protected $casts = [
+        'email_verified_at' => 'datetime',
+        'password' => 'hashed',
+    ];
+
+    public function isAdmin(): bool   { return $this->role === 'admin'; }
+    public function isTeacher(): bool { return $this->role === 'teacher'; }
+    public function isStudent(): bool { return $this->role === 'student'; }
+
+    // Courses this user teaches (if teacher)
+    public function coursesTaught()
+    {
+        return $this->hasMany(Course::class, 'teacher_id');
+    }
+
+    // Courses this user is enrolled in (if student)
+    public function enrollments()
+    {
+        return $this->hasMany(Enrollment::class, 'student_id');
+    }
+
+    public function courses()
+    {
+        return $this->belongsToMany(Course::class, 'enrollments', 'student_id', 'course_id');
+    }
+
+    public function attendances()
+    {
+        return $this->hasMany(Attendance::class, 'student_id');
+    }
+}
+===== app\Http\Controllers\Controller.php ===== 
+<?php
+
+namespace App\Http\Controllers;
+
+abstract class Controller
+{
+    //
+}
+===== app\Http\Controllers\DashboardController.php ===== 
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Support\Facades\Auth;
+
+class DashboardController extends Controller
+{
+    // Sends every logged-in user to the dashboard for their role
+    public function index()
+    {
+        $user = Auth::user();
+
+        if ($user->isAdmin())   return view('dashboard.admin');
+        if ($user->isTeacher()) return view('dashboard.teacher', [
+            'courses' => $user->coursesTaught()->withCount('students')->get(),
+        ]);
+
+        // student
+        $courses = $user->courses()->get()->map(function ($course) use ($user) {
+            $course->my_percent = $course->attendancePercentFor($user->id);
+            return $course;
+        });
+
+        return view('dashboard.student', ['courses' => $courses]);
+    }
+}
+===== app\Http\Controllers\StudentController.php ===== 
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Course;
+use Illuminate\Support\Facades\Auth;
+
+class StudentController extends Controller
+{
+    // View-only: a student may only ever look at their own course data
+    protected function myCourse(int $courseId): Course
+    {
+        return Auth::user()->courses()->findOrFail($courseId);
+    }
+
+    public function attendance(Course $course)
+    {
+        $course = $this->myCourse($course->id);
+        $records = $course->attendances()
+            ->where('student_id', Auth::id())
+            ->orderByDesc('date')
+            ->get();
+        $percent = $course->attendancePercentFor(Auth::id());
+
+        return view('attendance.student', compact('course', 'records', 'percent'));
+    }
+
+    public function gradebook(Course $course)
+    {
+        $course = $this->myCourse($course->id);
+        $studentId = Auth::id();
+
+        $quizzes = $course->quizzes()->with(['marks' => fn ($q) => $q->where('student_id', $studentId)])->get();
+        $assignments = $course->assignments()->with(['marks' => fn ($q) => $q->where('student_id', $studentId)])->get();
+
+        return view('gradebook.student', compact('course', 'quizzes', 'assignments'));
+    }
+}
+===== app\Http\Controllers\TeacherController.php ===== 
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Assignment;
+use App\Models\AssignmentMark;
+use App\Models\Attendance;
+use App\Models\Course;
+use App\Models\Quiz;
+use App\Models\QuizMark;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+
+class TeacherController extends Controller
+{
+    // Only lets a teacher touch a course they actually own
+    protected function ownedCourse(int $courseId): Course
+    {
+        return Course::where('teacher_id', Auth::id())->findOrFail($courseId);
+    }
+
+    public function showAttendance(Request $request, Course $course)
+    {
+        $course = $this->ownedCourse($course->id);
+        $date = $request->query('date', now()->toDateString());
+        $students = $course->students()->orderBy('name')->get();
+
+        $existing = Attendance::where('course_id', $course->id)->where('date', $date)
+            ->pluck('status', 'student_id');
+
+        return view('attendance.mark', compact('course', 'students', 'date', 'existing'));
+    }
+
+    public function saveAttendance(Request $request, Course $course)
+    {
+        $course = $this->ownedCourse($course->id);
+        $data = $request->validate([
+            'date' => ['required', 'date'],
+            'status' => ['required', 'array'],
+            'status.*' => ['in:present,absent,late'],
+        ]);
+
+        foreach ($data['status'] as $studentId => $status) {
+            Attendance::updateOrCreate(
+                ['student_id' => $studentId, 'course_id' => $course->id, 'date' => $data['date']],
+                ['status' => $status, 'marked_by' => Auth::id(), 'source' => 'manual']
+            );
+        }
+
+        return back()->with('status', 'Attendance saved for ' . $data['date']);
+    }
+
+    public function gradebook(Course $course)
+    {
+        $course = $this->ownedCourse($course->id);
+        $course->load('quizzes.marks', 'assignments.marks', 'students');
+        return view('gradebook.teacher', compact('course'));
+    }
+
+    public function storeQuiz(Request $request, Course $course)
+    {
+        $course = $this->ownedCourse($course->id);
+        $data = $request->validate([
+            'title' => ['required', 'string'],
+            'total_marks' => ['required', 'integer', 'min:1'],
+            'quiz_date' => ['nullable', 'date'],
+        ]);
+        $course->quizzes()->create($data);
+        return back()->with('status', 'Quiz added.');
+    }
+
+    public function storeAssignment(Request $request, Course $course)
+    {
+        $course = $this->ownedCourse($course->id);
+        $data = $request->validate([
+            'title' => ['required', 'string'],
+            'total_marks' => ['required', 'integer', 'min:1'],
+            'due_date' => ['nullable', 'date'],
+        ]);
+        $course->assignments()->create($data);
+        return back()->with('status', 'Assignment added.');
+    }
+
+    public function saveQuizMarks(Request $request, Quiz $quiz)
+    {
+        $this->ownedCourse($quiz->course_id);
+        $data = $request->validate(['marks' => ['required', 'array']]);
+        foreach ($data['marks'] as $studentId => $marks) {
+            QuizMark::updateOrCreate(
+                ['quiz_id' => $quiz->id, 'student_id' => $studentId],
+                ['marks_obtained' => $marks]
+            );
+        }
+        return back()->with('status', 'Quiz marks saved.');
+    }
+
+    public function saveAssignmentMarks(Request $request, Assignment $assignment)
+    {
+        $this->ownedCourse($assignment->course_id);
+        $data = $request->validate(['marks' => ['required', 'array']]);
+        foreach ($data['marks'] as $studentId => $marks) {
+            AssignmentMark::updateOrCreate(
+                ['assignment_id' => $assignment->id, 'student_id' => $studentId],
+                ['marks_obtained' => $marks]
+            );
+        }
+        return back()->with('status', 'Assignment marks saved.');
+    }
+}
+===== app\Http\Controllers\Admin\CourseController.php ===== 
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Models\Course;
+use App\Models\User;
+use Illuminate\Http\Request;
+
+class CourseController extends Controller
+{
+    public function index()
+    {
+        return view('courses.index', ['courses' => Course::with('teacher')->withCount('students')->get()]);
+    }
+
+    public function create()
+    {
+        return view('courses.create', ['teachers' => User::where('role', 'teacher')->get()]);
+    }
+
+    public function store(Request $request)
+    {
+        $data = $request->validate([
+            'code' => ['required', 'string', 'unique:courses,code'],
+            'title' => ['required', 'string'],
+            'credit_hours' => ['required', 'integer', 'min:1', 'max:6'],
+            'teacher_id' => ['nullable', 'exists:users,id'],
+        ]);
+
+        Course::create($data);
+        return redirect()->route('admin.courses.index')->with('status', 'Course created.');
+    }
+
+    public function enroll(Request $request, Course $course)
+    {
+        $data = $request->validate(['student_id' => ['required', 'exists:users,id']]);
+        $course->students()->syncWithoutDetaching([$data['student_id']]);
+        return back()->with('status', 'Student enrolled.');
+    }
+
+    public function destroy(Course $course)
+    {
+        $course->delete();
+        return back()->with('status', 'Course removed.');
+    }
+}
+===== app\Http\Controllers\Admin\UserController.php ===== 
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Hash;
+
+class UserController extends Controller
+{
+    public function index()
+    {
+        return view('users.index', ['users' => User::orderBy('role')->orderBy('name')->paginate(20)]);
+    }
+
+    public function create()
+    {
+        return view('users.create');
+    }
+
+    public function store(Request $request)
+    {
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'email' => ['required', 'email', 'unique:users,email'],
+            'password' => ['required', 'min:6'],
+            'role' => ['required', 'in:admin,teacher,student'],
+            'roll_no' => ['nullable', 'string', 'unique:users,roll_no'],
+            'lora_tag_id' => ['nullable', 'string', 'unique:users,lora_tag_id'],
+        ]);
+
+        $data['password'] = Hash::make($data['password']);
+        User::create($data);
+
+        return redirect()->route('admin.users.index')->with('status', 'User created.');
+    }
+
+    public function destroy(User $user)
+    {
+        $user->delete();
+        return back()->with('status', 'User removed.');
+    }
+}
+===== database\migrations\2024_01_01_000001_add_role_to_users_table.php ===== 
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->enum('role', ['admin', 'teacher', 'student'])->default('student')->after('email');
+            $table->string('roll_no')->nullable()->unique()->after('role');
+            $table->string('lora_tag_id')->nullable()->unique()->after('roll_no'); // RFID/BLE tag ID carried by the student, read by the LoRaWAN end-node
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->dropColumn(['role', 'roll_no', 'lora_tag_id']);
+        });
+    }
+};
+===== database\migrations\2024_01_01_000002_create_courses_table.php ===== 
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::create('courses', function (Blueprint $table) {
+            $table->id();
+            $table->string('code')->unique();
+            $table->string('title');
+            $table->unsignedTinyInteger('credit_hours')->default(3);
+            $table->foreignId('teacher_id')->nullable()->constrained('users')->nullOnDelete();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void { Schema::dropIfExists('courses'); }
+};
+===== database\migrations\2024_01_01_000003_create_enrollments_table.php ===== 
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::create('enrollments', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('student_id')->constrained('users')->cascadeOnDelete();
+            $table->foreignId('course_id')->constrained('courses')->cascadeOnDelete();
+            $table->timestamps();
+            $table->unique(['student_id', 'course_id']);
+        });
+    }
+
+    public function down(): void { Schema::dropIfExists('enrollments'); }
+};
+===== database\migrations\2024_01_01_000004_create_attendances_table.php ===== 
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::create('attendances', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('student_id')->constrained('users')->cascadeOnDelete();
+            $table->foreignId('course_id')->constrained('courses')->cascadeOnDelete();
+            $table->date('date');
+            $table->enum('status', ['present', 'absent', 'late'])->default('absent');
+            $table->foreignId('marked_by')->nullable()->constrained('users')->nullOnDelete();
+            $table->enum('source', ['manual', 'lorawan'])->default('manual');
+            $table->timestamps();
+            $table->unique(['student_id', 'course_id', 'date']);
+        });
+    }
+
+    public function down(): void { Schema::dropIfExists('attendances'); }
+};
+===== database\migrations\2024_01_01_000005_create_quizzes_and_assignments_tables.php ===== 
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::create('quizzes', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('course_id')->constrained('courses')->cascadeOnDelete();
+            $table->string('title');
+            $table->unsignedSmallInteger('total_marks')->default(10);
+            $table->date('quiz_date')->nullable();
+            $table->timestamps();
+        });
+
+        Schema::create('quiz_marks', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('quiz_id')->constrained('quizzes')->cascadeOnDelete();
+            $table->foreignId('student_id')->constrained('users')->cascadeOnDelete();
+            $table->decimal('marks_obtained', 5, 2)->default(0);
+            $table->timestamps();
+            $table->unique(['quiz_id', 'student_id']);
+        });
+
+        Schema::create('assignments', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('course_id')->constrained('courses')->cascadeOnDelete();
+            $table->string('title');
+            $table->unsignedSmallInteger('total_marks')->default(20);
+            $table->date('due_date')->nullable();
+            $table->timestamps();
+        });
+
+        Schema::create('assignment_marks', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('assignment_id')->constrained('assignments')->cascadeOnDelete();
+            $table->foreignId('student_id')->constrained('users')->cascadeOnDelete();
+            $table->decimal('marks_obtained', 5, 2)->default(0);
+            $table->timestamps();
+            $table->unique(['assignment_id', 'student_id']);
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('assignment_marks');
+        Schema::dropIfExists('assignments');
+        Schema::dropIfExists('quiz_marks');
+        Schema::dropIfExists('quizzes');
+    }
+};
+===== database\migrations\2024_01_01_000006_create_coordinator_logs_table.php ===== 
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        // Every uplink the LoRaWAN coordinator/gateway forwards is logged here,
+        // whether or not it could be matched to a student, for auditing.
+        Schema::create('coordinator_logs', function (Blueprint $table) {
+            $table->id();
+            $table->string('device_eui')->nullable();
+            $table->string('tag_id')->nullable();
+            $table->json('raw_payload')->nullable();
+            $table->foreignId('matched_student_id')->nullable()->constrained('users')->nullOnDelete();
+            $table->foreignId('matched_attendance_id')->nullable()->constrained('attendances')->nullOnDelete();
+            $table->enum('status', ['matched', 'unknown_tag', 'no_active_course'])->default('unknown_tag');
+            $table->timestamp('received_at')->nullable();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void { Schema::dropIfExists('coordinator_logs'); }
+};
+===== database\seeders\AdminSeeder.php ===== 
+<?php
+
+namespace Database\Seeders;
+
+use App\Models\User;
+use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\Hash;
+
+class AdminSeeder extends Seeder
+{
+    public function run(): void
+    {
+        User::updateOrCreate(['email' => 'admin@school.test'], [
+            'name' => 'System Admin',
+            'password' => Hash::make('password'),
+            'role' => 'admin',
+        ]);
+
+        User::updateOrCreate(['email' => 'teacher@school.test'], [
+            'name' => 'Sample Teacher',
+            'password' => Hash::make('password'),
+            'role' => 'teacher',
+        ]);
+
+        User::updateOrCreate(['email' => 'student@school.test'], [
+            'name' => 'Sample Student',
+            'password' => Hash::make('password'),
+            'role' => 'student',
+            'roll_no' => 'S-2201',
+            'lora_tag_id' => 'S-2201',
+        ]);
+    }
+}
+===== resources\views\layouts\app.blade.php ===== 
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>@yield('title', 'Attendance System')</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<nav class="navbar navbar-expand navbar-dark bg-dark px-3">
+    <a class="navbar-brand" href="{{ route('dashboard') }}">📋 Attendance & Gradebook System</a>
+    @auth
+    <div class="ms-auto d-flex align-items-center gap-3">
+        <span class="text-white-50">{{ auth()->user()->name }} ({{ ucfirst(auth()->user()->role) }})</span>
+        <form action="{{ route('logout') }}" method="POST">
+            @csrf
+            <button class="btn btn-sm btn-outline-light">Logout</button>
+        </form>
+    </div>
+    @endauth
+</nav>
+<div class="container py-4">
+    @if (session('status'))
+        <div class="alert alert-success">{{ session('status') }}</div>
+    @endif
+    @if ($errors->any())
+        <div class="alert alert-danger">
+            <ul class="mb-0">@foreach ($errors->all() as $e)<li>{{ $e }}</li>@endforeach</ul>
+        </div>
+    @endif
+    @yield('content')
+</div>
+</body>
+</html>
+===== resources\views\courses\create.blade.php ===== 
+@extends('layouts.app')
+@section('title', 'New Course')
+@section('content')
+<h3>New Course</h3>
+<form method="POST" action="{{ route('admin.courses.store') }}" class="col-md-6">
+  @csrf
+  <div class="mb-3"><label class="form-label">Code</label><input name="code" class="form-control" required placeholder="CS-301"></div>
+  <div class="mb-3"><label class="form-label">Title</label><input name="title" class="form-control" required></div>
+  <div class="mb-3"><label class="form-label">Credit Hours</label><input type="number" name="credit_hours" class="form-control" value="3" required></div>
+  <div class="mb-3">
+    <label class="form-label">Teacher</label>
+    <select name="teacher_id" class="form-select">
+      <option value="">— unassigned —</option>
+      @foreach ($teachers as $t)<option value="{{ $t->id }}">{{ $t->name }}</option>@endforeach
+    </select>
+  </div>
+  <button class="btn btn-primary">Create</button>
+</form>
+@endsection
+===== resources\views\courses\index.blade.php ===== 
+@extends('layouts.app')
+@section('title', 'Courses')
+@section('content')
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3>Courses</h3>
+  <a href="{{ route('admin.courses.create') }}" class="btn btn-primary btn-sm">+ New Course</a>
+</div>
+<table class="table bg-white">
+  <thead><tr><th>Code</th><th>Title</th><th>Teacher</th><th>Students</th><th></th></tr></thead>
+  <tbody>
+  @foreach ($courses as $c)
+    <tr>
+      <td>{{ $c->code }}</td><td>{{ $c->title }}</td>
+      <td>{{ $c->teacher->name ?? '—' }}</td>
+      <td>{{ $c->students_count }}</td>
+      <td>
+        <a class="btn btn-sm btn-outline-primary" href="{{ route('teacher.attendance.show', $c) }}">Attendance</a>
+        <a class="btn btn-sm btn-outline-primary" href="{{ route('teacher.gradebook', $c) }}">Gradebook</a>
+        <form action="{{ route('admin.courses.destroy', $c) }}" method="POST" class="d-inline" onsubmit="return confirm('Delete course?')">
+          @csrf @method('DELETE')
+          <button class="btn btn-sm btn-outline-danger">Delete</button>
+        </form>
+      </td>
+    </tr>
+  @endforeach
+  </tbody>
+</table>
+@endsection
+===== resources\views\users\create.blade.php ===== 
+@extends('layouts.app')
+@section('title', 'New User')
+@section('content')
+<h3>New User</h3>
+<form method="POST" action="{{ route('admin.users.store') }}" class="col-md-6">
+  @csrf
+  <div class="mb-3"><label class="form-label">Name</label><input name="name" class="form-control" required></div>
+  <div class="mb-3"><label class="form-label">Email</label><input type="email" name="email" class="form-control" required></div>
+  <div class="mb-3"><label class="form-label">Password</label><input type="password" name="password" class="form-control" required></div>
+  <div class="mb-3">
+    <label class="form-label">Role</label>
+    <select name="role" class="form-select" required>
+      <option value="student">Student</option>
+      <option value="teacher">Teacher</option>
+      <option value="admin">Admin</option>
+    </select>
+  </div>
+  <div class="mb-3"><label class="form-label">Roll No (students)</label><input name="roll_no" class="form-control"></div>
+  <div class="mb-3"><label class="form-label">LoRaWAN Tag ID (students, for auto attendance)</label><input name="lora_tag_id" class="form-control"></div>
+  <button class="btn btn-primary">Create</button>
+</form>
+@endsection
+===== resources\views\users\index.blade.php ===== 
+@extends('layouts.app')
+@section('title', 'Users')
+@section('content')
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3>Users</h3>
+  <a href="{{ route('admin.users.create') }}" class="btn btn-primary btn-sm">+ New User</a>
+</div>
+<table class="table bg-white">
+  <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Roll No</th><th>LoRa Tag</th><th></th></tr></thead>
+  <tbody>
+  @foreach ($users as $u)
+    <tr>
+      <td>{{ $u->name }}</td><td>{{ $u->email }}</td><td>{{ ucfirst($u->role) }}</td>
+      <td>{{ $u->roll_no }}</td><td>{{ $u->lora_tag_id }}</td>
+      <td>
+        <form action="{{ route('admin.users.destroy', $u) }}" method="POST" onsubmit="return confirm('Remove this user?')">
+          @csrf @method('DELETE')
+          <button class="btn btn-sm btn-outline-danger">Remove</button>
+        </form>
+      </td>
+    </tr>
+  @endforeach
+  </tbody>
+</table>
+{{ $users->links() }}
+@endsection
+===== resources\views\dashboard\admin.blade.php ===== 
+@extends('layouts.app')
+@section('title', 'Admin Dashboard')
+@section('content')
+<h3>Admin Dashboard</h3>
+<p class="text-muted">Full control: manage users, courses, enrollments, and oversee attendance & gradebooks.</p>
+<div class="row g-3">
+  <div class="col-md-4">
+    <div class="card"><div class="card-body">
+      <h5>Users</h5>
+      <p class="text-muted">Create/remove admins, teachers, students. Assign LoRaWAN tag IDs.</p>
+      <a href="{{ route('admin.users.index') }}" class="btn btn-sm btn-primary">Manage Users</a>
+    </div></div>
+  </div>
+  <div class="col-md-4">
+    <div class="card"><div class="card-body">
+      <h5>Courses</h5>
+      <p class="text-muted">Create courses, assign a teacher, enroll students.</p>
+      <a href="{{ route('admin.courses.index') }}" class="btn btn-sm btn-primary">Manage Courses</a>
+    </div></div>
+  </div>
+  <div class="col-md-4">
+    <div class="card"><div class="card-body">
+      <h5>Attendance & Gradebook</h5>
+      <p class="text-muted">Open any course below to view/edit attendance and marks, same as a teacher.</p>
+      <a href="{{ route('admin.courses.index') }}" class="btn btn-sm btn-outline-primary">Go to Courses</a>
+    </div></div>
+  </div>
+</div>
+@endsection
+===== resources\views\dashboard\student.blade.php ===== 
+@extends('layouts.app')
+@section('title', 'Student Dashboard')
+@section('content')
+<h3>My Courses</h3>
+<table class="table bg-white">
+  <thead><tr><th>Code</th><th>Title</th><th>My Attendance %</th><th>Attendance</th><th>Gradebook</th></tr></thead>
+  <tbody>
+  @forelse ($courses as $c)
+    <tr>
+      <td>{{ $c->code }}</td>
+      <td>{{ $c->title }}</td>
+      <td>
+        <span class="badge {{ $c->my_percent >= 75 ? 'bg-success' : 'bg-danger' }}">{{ $c->my_percent }}%</span>
+      </td>
+      <td><a class="btn btn-sm btn-outline-primary" href="{{ route('student.attendance', $c) }}">View</a></td>
+      <td><a class="btn btn-sm btn-outline-primary" href="{{ route('student.gradebook', $c) }}">View</a></td>
+    </tr>
+  @empty
+    <tr><td colspan="5" class="text-muted">You're not enrolled in any course yet.</td></tr>
+  @endforelse
+  </tbody>
+</table>
+@endsection
+===== resources\views\dashboard\teacher.blade.php ===== 
+@extends('layouts.app')
+@section('title', 'Teacher Dashboard')
+@section('content')
+<h3>My Courses</h3>
+<table class="table bg-white">
+  <thead><tr><th>Code</th><th>Title</th><th>Students</th><th>Attendance</th><th>Gradebook</th></tr></thead>
+  <tbody>
+  @forelse ($courses as $c)
+    <tr>
+      <td>{{ $c->code }}</td>
+      <td>{{ $c->title }}</td>
+      <td>{{ $c->students_count }}</td>
+      <td><a class="btn btn-sm btn-primary" href="{{ route('teacher.attendance.show', $c) }}">Mark / Edit</a></td>
+      <td><a class="btn btn-sm btn-outline-primary" href="{{ route('teacher.gradebook', $c) }}">Open</a></td>
+    </tr>
+  @empty
+    <tr><td colspan="5" class="text-muted">No courses assigned to you yet — ask the admin to assign one.</td></tr>
+  @endforelse
+  </tbody>
+</table>
+@endsection
+===== resources\views\roster\show.blade.php ===== 
+@extends('layouts.app')
+@section('title', 'Roster')
+@section('content')
+<h3>{{ $course->code }} — {{ $course->title }}: Roster</h3>
+
+@if (session('status'))
+  <div class="alert alert-success">{{ session('status') }}</div>
+@endif
+@if ($errors->any())
+  <div class="alert alert-danger">{{ $errors->first() }}</div>
+@endif
+
+<div class="row">
+  <div class="col-md-6">
+    <h5>Enrolled Students ({{ $course->students->count() }})</h5>
+    <table class="table bg-white">
+      <thead><tr><th>Name</th><th>Roll No</th><th></th></tr></thead>
+      <tbody>
+      @forelse ($course->students->sortBy('name') as $s)
+        <tr>
+          <td>{{ $s->name }}</td>
+          <td>{{ $s->roll_no }}</td>
+          <td>
+            <form action="{{ route('teacher.roster.unenroll', [$course, $s]) }}" method="POST" onsubmit="return confirm('Remove {{ $s->name }} from this course?')">
+              @csrf @method('DELETE')
+              <button class="btn btn-sm btn-outline-danger">Remove</button>
+            </form>
+          </td>
+        </tr>
+      @empty
+        <tr><td colspan="3" class="text-muted">No students enrolled yet.</td></tr>
+      @endforelse
+      </tbody>
+    </table>
+  </div>
+
+  <div class="col-md-6">
+    <h5>Enroll a Student</h5>
+    <form action="{{ route('teacher.roster.enroll', $course) }}" method="POST" class="row g-2">
+      @csrf
+      <div class="col-8">
+        <select name="student_id" class="form-select" required>
+          <option value="">-- Select student --</option>
+          @foreach ($available as $s)
+            <option value="{{ $s->id }}">{{ $s->name }} ({{ $s->roll_no }})</option>
+          @endforeach
+        </select>
+      </div>
+      <div class="col-4">
+        <button class="btn btn-primary w-100">Enroll</button>
+      </div>
+    </form>
+    @if ($available->isEmpty())
+      <p class="text-muted mt-2">Every student is already enrolled in this course.</p>
+    @endif
+  </div>
+</div>
+
+<div class="mt-3">
+  <a href="{{ route('teacher.attendance.show', $course) }}" class="btn btn-sm btn-outline-primary">Go to Attendance</a>
+  <a href="{{ route('teacher.gradebook', $course) }}" class="btn btn-sm btn-outline-primary">Go to Gradebook</a>
+</div>
+@endsection
